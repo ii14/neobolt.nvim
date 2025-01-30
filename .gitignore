@@ -1,0 +1,8 @@
+/lua/libneobolt.so
+/neobolt
+/neobolt_fuzz
+
+perf.data
+perf.data.old
+
+/scratch
