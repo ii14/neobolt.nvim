@@ -15,27 +15,9 @@ if not lib_ok then
 end
 
 
-local DEFAULT_EXE = 'g++'
--- local DEFAULT_EXE = 'clang++-16'
--- local DEFAULT_EXE = 'aarch64-linux-gnu-g++'
-
-local DEFAULT_ARGS = {
-  '-S', -- asm output
-  '-g', -- debug info
-  '-o', '-', -- write to stdout
-  '-x', 'c++', -- cringe++ mode
-  '-', -- read from stdin
-}
-
-local DEFAULT_USER_ARGS = {
-  -- TODO: -masm=intel only on x86_64?
-  --       or just don't do it by default, let the user set the defaults
-  '-masm=intel',
-  '-Wall',
-  '-Wextra',
-}
-
-local DEBOUNCE = 500
+-- TODO: try to make the time adaptive. maybe the first change should start compiling
+--       instantly, and only if more changes happen during that, it can start debouncing
+local DEBOUNCE = 100
 
 
 local t_insert = table.insert
@@ -102,7 +84,8 @@ local function new_update_state()
   return {
     -- command line
     exe = '',
-    args = {},
+    base_args = {},
+    user_args = {},
     cwd = '',
 
     -- source buffer changedtick
@@ -127,11 +110,16 @@ function Compiler.new(asm_buf, src_buf, opts)
   assert(b_valid(asm_buf))
   assert(b_valid(src_buf))
 
+  assert(type(opts) == 'table')
+  assert(type(opts.exe) == 'string')
+  assert(type(opts.base_args) == 'table')
+  assert(type(opts.user_args) == 'table')
+
   opts = opts or {}
   local cwd = opts.cwd or uv.cwd()
-  local exe = opts.exe or DEFAULT_EXE
-  local args = opts.args or vim.deepcopy(DEFAULT_ARGS)
-  local user_args = opts.user_args or vim.deepcopy(DEFAULT_USER_ARGS)
+  local exe = opts.exe
+  local base_args = vim.deepcopy(opts.base_args)
+  local user_args = vim.deepcopy(opts.user_args)
 
   return setmetatable({
     id = nil,
@@ -145,7 +133,7 @@ function Compiler.new(asm_buf, src_buf, opts)
     -- compiler executable
     exe = exe,
     -- base arguments
-    args = args,
+    base_args = base_args,
     -- user provided arguments
     user_args = user_args,
 
@@ -343,21 +331,22 @@ function Compiler:update()
   state.cwd = self.cwd
   state.exe = fn.exepath(self.exe)
   assert(state.exe and state.exe ~= '', 'invalid executable') -- TODO: error handling
+  state.base_args = vim.deepcopy(self.base_args)
   state.user_args = vim.deepcopy(self.user_args) -- TODO: copy might not be necessary?
 
-  state.args = {}
-  for i = 1, #self.args do
-    t_insert(state.args, self.args[i])
+  local args = {}
+  for i = 1, #self.base_args do
+    t_insert(args, self.base_args[i])
   end
   for i = 1, #self.user_args do
-    t_insert(state.args, self.user_args[i])
+    t_insert(args, self.user_args[i])
   end
 
   -- TODO: limit the number of max parallel jobs. eg when you have multiple compilers
   --       attached to a single source buffer
   -- TODO: handle errors
   -- TODO: timeout
-  self.proc = spawn(state.exe, state.args, state.cwd, src, function(proc)
+  self.proc = spawn(state.exe, args, state.cwd, src, function(proc)
     if self.proc == proc then
       self.proc = nil
     end
@@ -734,80 +723,12 @@ local function set_config(bufnr, config)
 end
 
 
-local DEFAULT_OPTS = {
-  c = {
-    exe = 'cc',
-    args = {'-S', '-g', '-o', '-', '-x', 'c', '-'},
-  },
-  cpp = {
-    exe = 'c++',
-    args = {'-S', '-g', '-o', '-', '-x', 'c++', '-'},
-  },
-}
-
--- TODO
-local function cmd_execute(ev)
-  local opts = nil
-
-  if ev.args:match('^%s*$') then
-    local ft = b_get_opt(0, 'filetype')
-    opts = DEFAULT_OPTS[ft]
-    if opts == nil then
-      print('Unknown filetype')
-      return
-    end
-  elseif ev.args == 'c' then
-    opts = DEFAULT_OPTS.c
-  elseif ev.args == 'cpp' then
-    opts = DEFAULT_OPTS.cpp
-  else
-    print('Invalid command')
-    return
-  end
-
-  local win = api.nvim_get_current_win()
-
-  local src_buf = b_get()
-  vim.cmd('vnew') -- TODO: configurable position
-  local asm_buf = b_get()
-
-  local compiler = Compiler.new(asm_buf, src_buf, opts)
-  compiler:init()
-
-  api.nvim_set_current_win(win)
-
-  compiler:update()
-end
-
--- TODO
-local function cmd_complete(arg, cmdline, pos)
-  local _, _, _ = arg, cmdline, pos
-end
-
-local function buf_read_cmd(ev)
-  local src_buf = ev.file:match('^neobolt://(%d+)$')
-  if not src_buf then
-    return ('neobolt.nvim: Invalid buffer name: %q'):format(ev.file)
-  end
-
-  src_buf = tonumber(src_buf)
-  if src_buf == 0 or not b_valid(src_buf) then
-    return ('neobolt.nvim: Invalid source buffer: %d'):format(src_buf)
-  end
-
-  local compiler = Compiler.new(ev.buf, src_buf)
-  compiler:init()
-  compiler:update()
-end
-
 return {
-  _cmd_execute = cmd_execute,
-  _cmd_complete = cmd_complete,
-  _buf_read_cmd = buf_read_cmd,
-
   -- TODO: for debugging. hide this in a separate module
   _asm_map = g_asm_map,
   _src_map = g_src_map,
+
+  _new_compiler = Compiler.new, -- TODO: not final
 
   get_config = get_config,
   set_config = set_config,
