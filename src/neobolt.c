@@ -290,6 +290,26 @@ typedef struct State {
 #endif
 } State;
 
+
+#ifndef NEOBOLT_LINES_INITIAL_CAP
+// on gcc hello world in C is 291 lines, 28 labels
+// C++ with iostream is 6211 lines, 395 labels
+# define NEOBOLT_LINES_INITIAL_CAP 2048
+#endif
+#ifndef NEOBOLT_LABEL_HASH_INITIAL_CAP
+# define NEOBOLT_LABEL_HASH_INITIAL_CAP 1024
+#endif
+#ifndef NEOBOLT_LABEL_QUEUE_INITIAL_CAP
+# define NEOBOLT_LABEL_QUEUE_INITIAL_CAP 64
+#endif
+#ifndef NEOBOLT_FILES_INITIAL_CAP
+# define NEOBOLT_FILES_INITIAL_CAP 64
+#endif
+#ifndef NEOBOLT_LOCATIONS_INITIAL_CAP
+# define NEOBOLT_LOCATIONS_INITIAL_CAP 256
+#endif
+
+
 INTERFACE bool neobolt_init(
     State* const restrict s,
     const byte* data,
@@ -347,9 +367,7 @@ static Line* line_push(
 
   if UNLIKELY (self->size == self->cap) {
     CHECK(self->cap < LINE_LIMIT); // hard line count cap
-    // on gcc hello world in C is 291 lines, 28 labels
-    // C++ with iostream is 6211 lines, 395 labels
-    u32 ncap = self->cap == 0 ? 2048 : self->cap << 1;
+    u32 ncap = self->cap == 0 ? NEOBOLT_LINES_INITIAL_CAP : self->cap << 1;
     // CHECK(ncap != 0); // overflow not possible with the hard cap
     void* ndata = realloc(self->data, cast(usize, ncap) * sizeof(*self->data));
     CHECK(ndata != NULL);
@@ -541,23 +559,17 @@ static void file_add(
   Files* const self = &s->files;
 
   if UNLIKELY (self->size == self->cap) {
-    u32 ncap = self->cap == 0 ? 64 : self->cap << 1;
+    u32 ncap = self->cap == 0 ? NEOBOLT_FILES_INITIAL_CAP : self->cap << 1;
     CHECK(ncap != 0); // overflow
-    int ok = 0;
 
     void* nids = realloc(self->ids, cast(usize, ncap) * sizeof(*self->ids));
-    if (nids != NULL) {
-      self->ids = nids;
-      ++ok;
-    }
+    CHECK(nids != NULL);
+    self->ids = nids;
 
     void* npaths = realloc(self->paths, cast(usize, ncap) * sizeof(*self->paths));
-    if (npaths != NULL) {
-      self->paths = npaths;
-      ++ok;
-    }
+    CHECK(npaths != NULL);
+    self->paths = npaths;
 
-    CHECK(ok == 2);
     self->cap = ncap;
   }
 
@@ -598,7 +610,7 @@ static u32 loc_push(
   }
 
   if UNLIKELY (self->size == self->cap) {
-    u32 ncap = self->cap == 0 ? 256 : self->cap << 1;
+    u32 ncap = self->cap == 0 ? NEOBOLT_LOCATIONS_INITIAL_CAP : self->cap << 1;
     CHECK(ncap != 0);
     void* ndata = realloc(self->data, cast(usize, ncap) * sizeof(*self->data));
     CHECK(ndata != NULL);
@@ -1052,14 +1064,14 @@ INTERFACE bool neobolt_parse(
     return false;
 
   CHECK(s->label_hash.data == NULL);
-  s->label_hash.data = calloc(1024, sizeof(*s->label_hash.data));
+  s->label_hash.data = calloc(NEOBOLT_LABEL_HASH_INITIAL_CAP, sizeof(*s->label_hash.data));
   CHECK(s->label_hash.data != NULL);
-  s->label_hash.cap = 1024;
+  s->label_hash.cap = NEOBOLT_LABEL_HASH_INITIAL_CAP;
 
   CHECK(s->label_queue.data == NULL);
-  s->label_queue.data = malloc(64 * sizeof(*s->label_queue.data));
+  s->label_queue.data = malloc(NEOBOLT_LABEL_QUEUE_INITIAL_CAP * sizeof(*s->label_queue.data));
   CHECK(s->label_queue.data != NULL);
-  s->label_queue.cap = 64;
+  s->label_queue.cap = NEOBOLT_LABEL_QUEUE_INITIAL_CAP;
 
 #if !defined(NEOBOLT_STATS)
   pass_1(s);

@@ -2,6 +2,7 @@ local M = {}
 
 
 ---@class neobolt.Config
+---@field path string
 ---@field base_args string[]
 ---@field user_args string[]
 
@@ -38,6 +39,7 @@ end
 M.templates = {
 
   gnu_c = M.Config {
+    -- TODO: -g1 produces shorter output. check if there aren't any downsides
     base_args = { '-S', '-g', '-x', 'c', '-o', '-', '-' },
     user_args = gnu_default_user_args(),
   },

@@ -20,14 +20,16 @@ return function(exe, args, cwd, input, callback)
     _proc = nil,
     _abort = false,
 
+    cwd = cwd,
     exe = exe,
     args = args,
-    cwd = cwd,
+
     code = nil,
     signal = nil,
+    time = nil,
+
     stdout = nil,
     stderr = nil,
-    time = nil,
   }, Process)
 
   local out = {}

@@ -3,15 +3,20 @@ local fn = vim.fn
 local uv = vim.loop
 
 local spawn = require('neobolt.spawn')
+local Registry = require('neobolt.registry')
+
 local lib_ok, lib = pcall(require, 'libneobolt')
--- TODO: embed version in the library and check if lua scripts are compatible,
---       or should the library be recompiled
+-- TODO: compile the library automatically?
 if not lib_ok then
-  -- TODO: compile the library automatically?
   api.nvim_echo({
-    {'neobolt.nvim: libneobolt module is missing! Run `make` in the plugin directory.', 'ErrorMsg'},
+    {'neobolt: libneobolt module is missing! Run `make` in neobolt plugin directory.', 'ErrorMsg'},
   }, true, {})
   error(lib)
+elseif lib.VERSION ~= 0 then
+  api.nvim_echo({
+    {'neobolt: Incompatible libneobolt version! Run `make` in neobolt plugin directory.', 'ErrorMsg'},
+  }, true, {})
+  error('neobolt: incompatible libneobolt version')
 end
 
 
@@ -36,6 +41,7 @@ local b_set_opt = api.nvim_buf_set_option
 local b_set_mark = api.nvim_buf_set_extmark
 local b_get_mark = api.nvim_buf_get_extmark_by_id
 local b_get_marks = api.nvim_buf_get_extmarks
+local b_del_marks = api.nvim_buf_clear_namespace
 local function b_changenr(bufnr)
   if bufnr == nil or bufnr == 0 then
     return fn.changenr()
@@ -53,11 +59,6 @@ end
 local NS = api.nvim_create_namespace('neobolt')
 -- only for extmarks with associated source locations
 local NS_LOC = api.nvim_create_namespace('neobolt_loc')
-
-
-local g_id = 0
-local g_asm_map = {}
-local g_src_map = {}
 
 
 local function normalize_bufnr(bufnr)
@@ -80,33 +81,47 @@ local function find_buf_win(buf)
   return nil
 end
 
-local function new_update_state()
-  return {
-    -- command line
-    exe = '',
-    base_args = {},
-    user_args = {},
-    cwd = '',
 
+-- currently highlighted source buffer number
+local g_src_hl = nil
+-- array of currently highlighted asm buffers
+local g_asm_hls = {}
+
+
+local Compiler = {}
+Compiler.__index = Compiler
+
+local function new_state()
+  return {
     -- source buffer changedtick
-    changedtick = nil,
+    changedtick = nil, ---@type integer?
     -- source buffer changenr
-    changenr = nil,
+    changenr = nil, ---@type integer?
+
+    config = {
+      -- working directory
+      cwd = '',
+      -- compiler executable
+      exe = '',
+      -- base arguments
+      base_args = {},
+      -- user provided arguments
+      user_args = {},
+    },
 
     -- maps extmark ids onto {file, line, column} tuples
     mark_to_loc = {},
     -- nested map of: file -> line -> extmark[]
     loc_to_mark = {},
     -- currently highlighted marks in asm buffer
-    asm_hls = {},
+    asm_hls = {}, ---@type integer[]
   }
 end
 
-
-local Compiler = {}
-local CompilerMT = { __index = Compiler }
-
-function Compiler.new(asm_buf, src_buf, opts)
+---@param asm_buf integer
+---@param src_buf integer
+---@param opts table
+local function new_compiler(asm_buf, src_buf, opts)
   assert(b_valid(asm_buf))
   assert(b_valid(src_buf))
 
@@ -115,27 +130,22 @@ function Compiler.new(asm_buf, src_buf, opts)
   assert(type(opts.base_args) == 'table')
   assert(type(opts.user_args) == 'table')
 
-  opts = opts or {}
-  local cwd = opts.cwd or uv.cwd()
-  local exe = opts.exe
-  local base_args = vim.deepcopy(opts.base_args)
-  local user_args = vim.deepcopy(opts.user_args)
-
   return setmetatable({
-    id = nil,
     -- asm buffer
     asm_buf = asm_buf,
     -- source buffer
     src_buf = src_buf,
 
-    -- working directory
-    cwd = cwd,
-    -- compiler executable
-    exe = exe,
-    -- base arguments
-    base_args = base_args,
-    -- user provided arguments
-    user_args = user_args,
+    config = {
+      -- working directory
+      cwd = opts.cwd or uv.cwd(),
+      -- compiler executable
+      exe = opts.exe,
+      -- base arguments
+      base_args = vim.deepcopy(opts.base_args),
+      -- user provided arguments
+      user_args = vim.deepcopy(opts.user_args),
+    },
 
     changed = true,
     in_insert = false,
@@ -145,53 +155,36 @@ function Compiler.new(asm_buf, src_buf, opts)
     -- running compiler process
     proc = nil,
     -- recreated on every update
-    update_state = new_update_state(),
+    state = new_state(),
     -- array of used autocmd IDs
     autocmds = {},
 
     _destroyed = false,
-  }, CompilerMT)
+  }, Compiler)
 end
 
 
 function Compiler:init()
-  -- _G.bb = self -- for debugging only
-
-  g_id = g_id + 1
-  self.id = g_id
   b_set_opt(self.asm_buf, 'buftype', 'nofile')
   b_set_opt(self.asm_buf, 'swapfile', false)
   b_set_opt(self.asm_buf, 'undofile', false)
   -- TODO: unlikely, but nvim_buf_set_name can fail if name is already taken
-  api.nvim_buf_set_name(self.asm_buf, ('neobolt://%d/%d'):format(self.src_buf, self.id))
+  api.nvim_buf_set_name(self.asm_buf, ('neobolt://%d'):format(self.asm_buf))
   b_set_opt(self.asm_buf, 'filetype', 'asm')
 
 
-  local AUTOCMD_DESC = ('neobolt %d'):format(self.asm_buf)
+  local au_desc = ('neobolt %d'):format(self.asm_buf)
   local function autocmd(events, buffer, callback)
     t_insert(self.autocmds, api.nvim_create_autocmd(events, {
-      desc = AUTOCMD_DESC,
+      desc = au_desc,
       buffer = buffer,
       callback = callback,
     }))
   end
 
-  autocmd('BufDelete', self.asm_buf, function() self:destroy() end)
-  autocmd('BufDelete', self.src_buf, function() self:destroy() end)
-
-  -- autocmd('CursorMoved', self.src_buf, function()
-  --   if not self:destroyed() then
-  --     if b_changedtick(self.src_buf) == self.update_state.changedtick then
-  --       self:highlight_asm(w_get_cursor(0)[1])
-  --     end
-  --   end
-  -- end)
-
-  -- autocmd('BufLeave', self.src_buf, function()
-  --   if not self:destroyed() then
-  --     self:highlight_asm(nil)
-  --   end
-  -- end)
+  local function destroy() self:destroy() end
+  autocmd('BufDelete', self.asm_buf, destroy)
+  autocmd('BufDelete', self.src_buf, destroy)
 
   autocmd({'TextChanged', 'TextChangedI', 'TextChangedP'}, self.src_buf, function()
     if not self:destroyed() then
@@ -225,7 +218,7 @@ function Compiler:init()
   api.nvim_buf_set_keymap(self.asm_buf, 'n', 'gO', '', {
     noremap = true,
     callback = function()
-      local curr = t_concat(self.user_args, ' ')
+      local curr = t_concat(self.config.user_args, ' ')
       local ok, opts = pcall(fn.input, {
         prompt = 'options: ',
         default = curr,
@@ -233,19 +226,13 @@ function Compiler:init()
       })
       if ok and curr ~= opts then
         -- TODO: handle escaped whitespace, quotes
-        self.user_args = vim.split(opts, '%s+', {trimempty = true})
+        self.config.user_args = vim.split(opts, '%s+', {trimempty = true})
         self:update()
       end
     end,
   })
 
-  -- register in the asm map
-  g_asm_map[self.asm_buf] = self
-  -- register in the src map
-  if g_src_map[self.src_buf] == nil then
-    g_src_map[self.src_buf] = {}
-  end
-  g_src_map[self.src_buf][self.asm_buf] = self
+  Registry.register(self)
 end
 
 
@@ -253,20 +240,7 @@ function Compiler:destroy()
   if self._destroyed then return end
   self._destroyed = true
 
-  -- unregister from the asm map
-  if g_asm_map[self.asm_buf] == self then
-    g_asm_map[self.asm_buf] = nil
-  end
-
-  -- unregister from the src map
-  if g_src_map[self.src_buf] then
-    if g_src_map[self.src_buf][self.asm_buf] == self then
-      g_src_map[self.src_buf][self.asm_buf] = nil
-      if next(g_src_map[self.src_buf]) == nil then
-        g_src_map[self.src_buf] = nil
-      end
-    end
-  end
+  Registry.unregister(self)
 
   -- close debounce timer
   if self.debounce then
@@ -311,6 +285,7 @@ function Compiler:update()
     self.proc:abort()
     self.proc = nil
   end
+
   if self:destroyed() then
     return
   end
@@ -319,7 +294,13 @@ function Compiler:update()
 
   -- TODO: expose the status to the user, so they can have a nice statusline or whatever
 
-  local state = new_update_state()
+  local state = new_state()
+
+  state.config.cwd = self.config.cwd
+  state.config.exe = fn.exepath(self.config.exe)
+  assert(state.config.exe and state.config.exe ~= '', 'invalid executable') -- TODO: error handling
+  state.config.base_args = vim.deepcopy(self.config.base_args)
+  state.config.user_args = vim.deepcopy(self.config.user_args)
 
   state.changedtick = b_changedtick(self.src_buf)
   state.changenr = b_changenr(self.src_buf)
@@ -328,25 +309,19 @@ function Compiler:update()
   t_insert(src, '\n')
   src = t_concat(src, '\n')
 
-  state.cwd = self.cwd
-  state.exe = fn.exepath(self.exe)
-  assert(state.exe and state.exe ~= '', 'invalid executable') -- TODO: error handling
-  state.base_args = vim.deepcopy(self.base_args)
-  state.user_args = vim.deepcopy(self.user_args) -- TODO: copy might not be necessary?
-
   local args = {}
-  for i = 1, #self.base_args do
-    t_insert(args, self.base_args[i])
+  for i = 1, #self.config.base_args do
+    t_insert(args, self.config.base_args[i])
   end
-  for i = 1, #self.user_args do
-    t_insert(args, self.user_args[i])
+  for i = 1, #self.config.user_args do
+    t_insert(args, self.config.user_args[i])
   end
 
   -- TODO: limit the number of max parallel jobs. eg when you have multiple compilers
   --       attached to a single source buffer
   -- TODO: handle errors
   -- TODO: timeout
-  self.proc = spawn(state.exe, args, state.cwd, src, function(proc)
+  self.proc = spawn(state.config.exe, args, state.config.cwd, src, function(proc)
     if self.proc == proc then
       self.proc = nil
     end
@@ -387,7 +362,7 @@ function Compiler:render(proc, state)
 
 
   -- discard previous state
-  self.update_state = state
+  self.state = state
 
   if asm then
     -- normalize paths
@@ -420,9 +395,9 @@ function Compiler:render(proc, state)
 
 
   local summary = {
-    ('#      cwd: %s'):format(state.cwd),
-    ('# compiler: %s'):format(state.exe),
-    ('#    flags: %s'):format(t_concat(state.user_args, ' ')),
+    ('#      cwd: %s'):format(state.config.cwd),
+    ('# compiler: %s'):format(state.config.exe),
+    ('#    flags: %s'):format(t_concat(state.config.user_args, ' ')),
     '',
     ('# exited with code %d, signal %d'):format(proc.code, proc.signal),
     ('# compiler %.6fs, process %.6fs'):format(proc.time, parse_time),
@@ -431,8 +406,8 @@ function Compiler:render(proc, state)
 
   -- extmark IDs overflow after UINT32_MAX, and if i'm reading it right it's
   -- per buffer+namespace. if we clear them every time, it's not a problem.
-  api.nvim_buf_clear_namespace(self.asm_buf, NS, 0, -1)
-  api.nvim_buf_clear_namespace(self.asm_buf, NS_LOC, 0, -1)
+  b_del_marks(self.asm_buf, NS, 0, -1)
+  b_del_marks(self.asm_buf, NS_LOC, 0, -1)
 
   -- reset undo history, so the user can still edit
   -- the buffer, but can't over-undo to previous states
@@ -514,15 +489,17 @@ function Compiler:render(proc, state)
   end
 
   -- update highlighting from the source buffer
-  if b_get() == self.src_buf then
-    self:highlight_asm(w_get_cursor(0)[1])
+  if b_get() == self.src_buf and self:in_sync() then
+    if self:highlight_asm(w_get_cursor(0)[1]) then
+      t_insert(g_asm_hls, self)
+    end
   end
 end
 
 function Compiler:in_sync()
   return b_valid(self.asm_buf) and
          b_valid(self.src_buf) and
-         b_changedtick(self.src_buf) == self.update_state.changedtick
+         b_changedtick(self.src_buf) == self.state.changedtick
 end
 
 
@@ -555,7 +532,7 @@ end
 function Compiler:get_src_line(lnum)
   local mark = get_mark_on_line(self.asm_buf, NS_LOC, lnum)
   if not mark then return end
-  local loc = assert(self.update_state.mark_to_loc[mark[1]])
+  local loc = assert(self.state.mark_to_loc[mark[1]])
   local file, line, col = loc[1], loc[2], loc[3]
   if file == '<stdin>' then
     return line, col
@@ -576,113 +553,108 @@ end
 
 function Compiler:highlight_asm(lnum)
   if not b_valid(self.asm_buf) then
-    return
+    return false
   end
 
   -- clear previous highlights
-  for i, mark in ipairs(self.update_state.asm_hls) do
+  for i, mark in ipairs(self.state.asm_hls) do
     update_mark(self.asm_buf, NS_LOC, mark, {})
-    self.update_state.asm_hls[i] = nil
+    self.state.asm_hls[i] = nil
   end
 
   -- clear only
   if lnum == nil then
-    return
+    return false
   end
 
-  local file = self.update_state.loc_to_mark['<stdin>']
-  if not file then return end
+  local file = self.state.loc_to_mark['<stdin>']
+  if not file then return false end
   local marks = file[lnum]
-  if not marks then return end
+  if not marks then return false end
   for _, mark in ipairs(marks) do
     update_mark(self.asm_buf, NS_LOC, mark, {
       hl_group = 'Visual',
       hl_eol = true,
     })
-    t_insert(self.update_state.asm_hls, mark)
+    t_insert(self.state.asm_hls, mark)
   end
+  return self.state.asm_hls[1] ~= nil
 end
 
 
-if true then
-  local g_src_hl = nil
-  local g_asm_hls = {}
+local function update_hls(bufnr)
+  bufnr = normalize_bufnr(bufnr)
+  local lnum = w_get_cursor(0)[1]
 
-  local function update_hls(bufnr)
-    bufnr = normalize_bufnr(bufnr)
-    local lnum = w_get_cursor(0)[1]
-
-    do -- update asm highlights
-      -- clear previous highlights
-      for i = 1, #g_asm_hls do
-        g_asm_hls[i]:highlight_asm(nil)
-        g_asm_hls[i] = nil
-      end
-
-      local asm_bufs = g_src_map[bufnr]
-      if asm_bufs ~= nil then
-        for _, compiler in pairs(asm_bufs) do
-          if compiler:in_sync() then
-            compiler:highlight_asm(lnum)
-            t_insert(g_asm_hls, compiler)
-          end
-        end
-      end
+  do -- update asm highlights
+    -- clear previous highlights
+    for i = 1, #g_asm_hls do
+      g_asm_hls[i]:highlight_asm(nil)
+      g_asm_hls[i] = nil
     end
 
-    do -- update source highlights
-      -- clear previous highlights
-      if g_src_hl ~= nil then
-        if b_valid(g_src_hl) then
-          api.nvim_buf_clear_namespace(g_src_hl, NS_LOC, 0, -1)
-        end
-        g_src_hl = nil
-      end
-
-      local compiler = g_asm_map[bufnr]
-      if compiler and compiler:in_sync() then
-        local line = compiler:get_src_line(lnum)
-        if line then
-          if pcall(b_set_mark, compiler.src_buf, NS_LOC, line - 1, 0, {
-            end_row = line,
-            hl_group = 'Visual',
-            hl_eol = true,
-          }) then
-            g_src_hl = compiler.src_buf
-          end
+    local asm_bufs = Registry.src_map[bufnr]
+    if asm_bufs ~= nil then
+      for _, compiler in pairs(asm_bufs) do
+        if compiler:in_sync() and compiler:highlight_asm(lnum) then
+          t_insert(g_asm_hls, compiler)
         end
       end
     end
   end
 
-  api.nvim_create_autocmd('CursorMoved', {
-    desc = 'neobolt: update highlights',
-    callback = function(ev)
-      update_hls(ev.buf)
-    end,
-  })
+  do -- update source highlights
+    -- clear previous highlights
+    if g_src_hl ~= nil then
+      if b_valid(g_src_hl) then
+        b_del_marks(g_src_hl, NS_LOC, 0, -1)
+      end
+      g_src_hl = nil
+    end
+
+    local compiler = Registry.asm_map[bufnr]
+    if compiler and compiler:in_sync() then
+      local line = compiler:get_src_line(lnum)
+      if line then
+        if pcall(b_set_mark, compiler.src_buf, NS_LOC, line - 1, 0, {
+          end_row = line,
+          hl_group = 'Visual',
+          hl_eol = true,
+        }) then
+          g_src_hl = compiler.src_buf
+        end
+      end
+    end
+  end
 end
+
+api.nvim_create_autocmd('CursorMoved', {
+  desc = 'neobolt: update highlights',
+  callback = function(ev)
+    update_hls(ev.buf)
+  end,
+})
 
 
 local function get_config(bufnr)
   bufnr = normalize_bufnr(bufnr)
 
-  local compiler = g_asm_map[bufnr]
+  local compiler = Registry.asm_map[bufnr]
   if not compiler then
     return nil
   end
 
   return {
-    cwd = compiler.cwd,
-    exe = compiler.exe,
-    args = vim.deepcopy(compiler.user_args), -- don't leak table ref to the outside world
+    cwd = compiler.config.cwd,
+    exe = compiler.config.exe,
+    args = vim.deepcopy(compiler.config.user_args), -- don't leak table ref to the outside world
   }
 end
 
 local function set_config(bufnr, config)
   bufnr = normalize_bufnr(bufnr)
 
-  local compiler = g_asm_map[bufnr]
+  local compiler = Registry.asm_map[bufnr]
   if not compiler then
     error('invalid bufnr, not an asm buffer')
     return
@@ -690,9 +662,9 @@ local function set_config(bufnr, config)
 
   assert(type(config) == 'table', 'expected table')
 
-  local cwd = config.cwd
-  local exe = config.exe
-  local args = config.args
+  local cwd = config.config.cwd
+  local exe = config.config.exe
+  local args = config.config.args
 
   if exe ~= nil then
     assert(type(exe) == 'string', 'expected string for `config.exe`')
@@ -710,13 +682,13 @@ local function set_config(bufnr, config)
   end
 
   if exe ~= nil then
-    compiler.exe = exe
+    compiler.config.exe = exe
   end
   if cwd ~= nil then
-    compiler.cwd = cwd
+    compiler.config.cwd = cwd
   end
   if args ~= nil then
-    compiler.user_args = vim.deepcopy(args) -- don't leak table ref to the outside world
+    compiler.config.user_args = vim.deepcopy(args) -- don't leak table ref to the outside world
   end
 
   compiler:update()
@@ -724,11 +696,7 @@ end
 
 
 return {
-  -- TODO: for debugging. hide this in a separate module
-  _asm_map = g_asm_map,
-  _src_map = g_src_map,
-
-  _new_compiler = Compiler.new, -- TODO: not final
+  _new_compiler = new_compiler, -- TODO: not final
 
   get_config = get_config,
   set_config = set_config,

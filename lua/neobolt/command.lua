@@ -83,11 +83,12 @@ local function cmd_execute(ev)
   end
 
 
+  local Compiler = require('neobolt.compiler')
   local win = vim.api.nvim_get_current_win()
   local src_buf = vim.api.nvim_get_current_buf()
   vim.cmd('vnew') -- TODO: configurable position
   local asm_buf = vim.api.nvim_get_current_buf()
-  local compiler = require('neobolt.compiler')._new_compiler(asm_buf, src_buf, opts)
+  local compiler = Compiler._new_compiler(asm_buf, src_buf, opts)
   compiler:init()
   vim.api.nvim_set_current_win(win)
   compiler:update()

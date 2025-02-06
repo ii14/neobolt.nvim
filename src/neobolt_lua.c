@@ -148,10 +148,12 @@ static int lneobolt_parse(
 EXPORT int luaopen_libneobolt(
     lua_State* L)
 {
-  lua_createtable(L, 0, 1);
+  lua_createtable(L, 0, 2);
 
   lua_pushcfunction(L, lneobolt_parse);
   lua_setfield(L, -2, "parse");
+  lua_pushinteger(L, 0);
+  lua_setfield(L, -2, "VERSION");
 
   return 1;
 }
